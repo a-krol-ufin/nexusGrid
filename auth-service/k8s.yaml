@@ -18,8 +18,10 @@ spec:
         ports:
         - containerPort: 8080
         env:
-        - name: KEYCLOAK_URL
+        - name: KEYCLOAK_INTERNAL_URL
           value: "http://keycloak:8080"
+        - name: KEYCLOAK_PUBLIC_URL
+          value: "http://localhost:8180"
         - name: KEYCLOAK_REALM
           value: "nexusgrid"
         - name: KEYCLOAK_CLIENT_ID

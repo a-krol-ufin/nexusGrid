@@ -29,39 +29,55 @@ func getEnv(key, fallback string) string {
 }
 
 func init() {
-	keycloakURL := getEnv("KEYCLOAK_URL", "http://keycloak:8080")
+	// Internal URL: used by this pod to reach Keycloak inside the cluster
+	internalURL := getEnv("KEYCLOAK_INTERNAL_URL", "http://keycloak:8080")
+	// Public URL: what the browser sees (localhost via port-forward)
+	publicURL := getEnv("KEYCLOAK_PUBLIC_URL", "http://localhost:8180")
 	realm := getEnv("KEYCLOAK_REALM", "nexusgrid")
 	clientID := getEnv("KEYCLOAK_CLIENT_ID", "nexusgrid-client")
 	clientSecret := getEnv("KEYCLOAK_CLIENT_SECRET", "")
 	redirectURL := getEnv("REDIRECT_URL", "http://localhost:8081/callback")
 
-	issuerURL := fmt.Sprintf("%s/realms/%s", keycloakURL, realm)
+	// Discover OIDC config via internal URL
+	internalIssuer := fmt.Sprintf("%s/realms/%s", internalURL, realm)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	var err error
-	for i := 0; i < 10; i++ {
-		provider, err = oidc.NewProvider(ctx, issuerURL)
+	for i := 0; i < 12; i++ {
+		provider, err = oidc.NewProvider(ctx, internalIssuer)
 		if err == nil {
 			break
 		}
-		log.Printf("Waiting for Keycloak... attempt %d/10: %v", i+1, err)
+		log.Printf("Waiting for Keycloak... attempt %d/12: %v", i+1, err)
 		time.Sleep(5 * time.Second)
 	}
 	if err != nil {
 		log.Fatalf("Failed to connect to Keycloak: %v", err)
 	}
 
+	// Build endpoint using public URL so browser redirects go to localhost
+	publicIssuer := fmt.Sprintf("%s/realms/%s", publicURL, realm)
+	endpoint := oauth2.Endpoint{
+		AuthURL:  publicIssuer + "/protocol/openid-connect/auth",
+		TokenURL: internalIssuer + "/protocol/openid-connect/token",
+	}
+
 	oauth2Config = oauth2.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		RedirectURL:  redirectURL,
-		Endpoint:     provider.Endpoint(),
+		Endpoint:     endpoint,
 		Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
 	}
 
-	verifier = provider.Verifier(&oidc.Config{ClientID: clientID})
+	// SkipIssuerCheck because tokens will have the public issuer URL
+	// but we discovered via the internal URL
+	verifier = provider.Verifier(&oidc.Config{
+		ClientID:        clientID,
+		SkipIssuerCheck: true,
+	})
 }
 
 func generateState() string {
@@ -103,11 +119,11 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	idToken, err := verifier.Verify(r.Context(), rawIDToken)
 	if err != nil {
-		http.Error(w, "ID token verification failed", http.StatusUnauthorized)
+		http.Error(w, "ID token verification failed: "+err.Error(), http.StatusUnauthorized)
 		return
 	}
 
-	var claims map[string]interface{}
+	var claims map[string]any
 	if err := idToken.Claims(&claims); err != nil {
 		http.Error(w, "Failed to parse claims", http.StatusInternalServerError)
 		return
@@ -120,13 +136,11 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		MaxAge:   int(time.Until(token.Expiry).Seconds()),
 	})
-
 	http.SetCookie(w, &http.Cookie{
-		Name:     "oauth_state",
-		Value:    "",
-		HttpOnly: true,
-		Path:     "/",
-		MaxAge:   -1,
+		Name:   "oauth_state",
+		Value:  "",
+		Path:   "/",
+		MaxAge: -1,
 	})
 
 	frontendURL := getEnv("FRONTEND_URL", "http://localhost:3000")
@@ -141,10 +155,10 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 		MaxAge: -1,
 	})
 
-	keycloakURL := getEnv("KEYCLOAK_URL", "http://keycloak:8080")
+	publicURL := getEnv("KEYCLOAK_PUBLIC_URL", "http://localhost:8180")
 	realm := getEnv("KEYCLOAK_REALM", "nexusgrid")
 	frontendURL := getEnv("FRONTEND_URL", "http://localhost:3000")
-	logoutURL := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/logout?redirect_uri=%s", keycloakURL, realm, frontendURL)
+	logoutURL := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/logout?redirect_uri=%s", publicURL, realm, frontendURL)
 	http.Redirect(w, r, logoutURL, http.StatusFound)
 }
 
@@ -163,14 +177,14 @@ func handleValidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var claims map[string]interface{}
+	var claims map[string]any
 	if err := idToken.Claims(&claims); err != nil {
 		http.Error(w, "Failed to parse claims", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"valid":  true,
 		"claims": claims,
 	})

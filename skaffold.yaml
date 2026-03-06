@@ -1,6 +1,8 @@
 apiVersion: skaffold/v4beta11
 kind: Config
 build:
+  local:
+    push: false
   artifacts:
     - image: auth-service
       context: auth-service
@@ -15,3 +17,24 @@ manifests:
     - auth-service/k8s.yaml
     - api-gateway/k8s.yaml
     - frontend/k8s.yaml
+portForward:
+  - resourceType: service
+    resourceName: frontend
+    port: 80
+    localPort: 3000
+  - resourceType: service
+    resourceName: api-gateway
+    port: 80
+    localPort: 8080
+  - resourceType: service
+    resourceName: auth-service
+    port: 80
+    localPort: 8081
+  - resourceType: service
+    resourceName: keycloak
+    port: 8080
+    localPort: 8180
+  - resourceType: service
+    resourceName: rabbitmq
+    port: 15672
+    localPort: 15672

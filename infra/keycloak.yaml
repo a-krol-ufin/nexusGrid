@@ -76,10 +76,18 @@ spec:
             secretKeyRef:
               name: keycloak-secret
               key: admin-password
+        - name: KC_HOSTNAME_URL
+          value: "http://localhost:8180"
+        - name: KC_HOSTNAME_ADMIN_URL
+          value: "http://localhost:8180"
         - name: KC_HOSTNAME_STRICT
+          value: "false"
+        - name: KC_HOSTNAME_STRICT_HTTPS
           value: "false"
         - name: KC_HTTP_ENABLED
           value: "true"
+        - name: KC_PROXY
+          value: "edge"
         volumeMounts:
         - name: realm-config
           mountPath: /opt/keycloak/data/import
