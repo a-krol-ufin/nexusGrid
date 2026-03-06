@@ -1,0 +1,17 @@
+apiVersion: skaffold/v4beta11
+kind: Config
+build:
+  artifacts:
+    - image: auth-service
+      context: auth-service
+    - image: api-gateway
+      context: api-gateway
+    - image: frontend
+      context: frontend
+manifests:
+  rawYaml:
+    - infra/keycloak.yaml
+    - infra/rabbitmq.yaml
+    - auth-service/k8s.yaml
+    - api-gateway/k8s.yaml
+    - frontend/k8s.yaml

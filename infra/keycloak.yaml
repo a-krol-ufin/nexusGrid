@@ -1,0 +1,122 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-secret
+type: Opaque
+stringData:
+  admin-password: "admin"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-client-secret
+type: Opaque
+stringData:
+  secret: "change-me-in-production"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-realm-config
+data:
+  nexusgrid-realm.json: |
+    {
+      "realm": "nexusgrid",
+      "enabled": true,
+      "clients": [
+        {
+          "clientId": "nexusgrid-client",
+          "enabled": true,
+          "publicClient": false,
+          "secret": "change-me-in-production",
+          "redirectUris": ["http://localhost:8081/callback", "http://auth-service/callback"],
+          "webOrigins": ["http://localhost:3000", "http://frontend"],
+          "standardFlowEnabled": true,
+          "directAccessGrantsEnabled": true
+        }
+      ],
+      "users": [
+        {
+          "username": "admin",
+          "enabled": true,
+          "email": "admin@nexusgrid.local",
+          "firstName": "Admin",
+          "lastName": "User",
+          "credentials": [{"type": "password", "value": "admin123", "temporary": false}],
+          "realmRoles": ["default-roles-nexusgrid"]
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      containers:
+      - name: keycloak
+        image: quay.io/keycloak/keycloak:24.0
+        args: ["start-dev", "--import-realm"]
+        ports:
+        - containerPort: 8080
+        env:
+        - name: KEYCLOAK_ADMIN
+          value: "admin"
+        - name: KEYCLOAK_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: keycloak-secret
+              key: admin-password
+        - name: KC_HOSTNAME_STRICT
+          value: "false"
+        - name: KC_HTTP_ENABLED
+          value: "true"
+        volumeMounts:
+        - name: realm-config
+          mountPath: /opt/keycloak/data/import
+        readinessProbe:
+          httpGet:
+            path: /realms/master
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 10
+        livenessProbe:
+          httpGet:
+            path: /realms/master
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 15
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+      volumes:
+      - name: realm-config
+        configMap:
+          name: keycloak-realm-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+spec:
+  selector:
+    app: keycloak
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
