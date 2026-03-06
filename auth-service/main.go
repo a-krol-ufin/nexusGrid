@@ -9,6 +9,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -16,9 +18,9 @@ import (
 )
 
 var (
-	provider     *oidc.Provider
 	oauth2Config oauth2.Config
 	verifier     *oidc.IDTokenVerifier
+	ready        atomic.Bool
 )
 
 func getEnv(key, fallback string) string {
@@ -28,62 +30,108 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-func init() {
-	// Internal URL: used by this pod to reach Keycloak inside the cluster
+type oidcDiscovery struct {
+	Issuer   string `json:"issuer"`
+	AuthURL  string `json:"authorization_endpoint"`
+	TokenURL string `json:"token_endpoint"`
+	JWKSURI  string `json:"jwks_uri"`
+}
+
+func fetchDiscovery(url string) (*oidcDiscovery, error) {
+	resp, err := http.Get(url + "/.well-known/openid-configuration")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+	var d oidcDiscovery
+	return &d, json.NewDecoder(resp.Body).Decode(&d)
+}
+
+func initKeycloak() {
 	internalURL := getEnv("KEYCLOAK_INTERNAL_URL", "http://keycloak:8080")
-	// Public URL: what the browser sees (localhost via port-forward)
 	publicURL := getEnv("KEYCLOAK_PUBLIC_URL", "http://localhost:8180")
 	realm := getEnv("KEYCLOAK_REALM", "nexusgrid")
 	clientID := getEnv("KEYCLOAK_CLIENT_ID", "nexusgrid-client")
 	clientSecret := getEnv("KEYCLOAK_CLIENT_SECRET", "")
 	redirectURL := getEnv("REDIRECT_URL", "http://localhost:8081/callback")
 
-	// Discover OIDC config via internal URL
 	internalIssuer := fmt.Sprintf("%s/realms/%s", internalURL, realm)
+	publicIssuer := fmt.Sprintf("%s/realms/%s", publicURL, realm)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
+	// Retry until Keycloak is up
+	var discovery *oidcDiscovery
 	var err error
-	for i := 0; i < 12; i++ {
-		provider, err = oidc.NewProvider(ctx, internalIssuer)
+	for i := 1; ; i++ {
+		discovery, err = fetchDiscovery(internalIssuer)
 		if err == nil {
 			break
 		}
-		log.Printf("Waiting for Keycloak... attempt %d/12: %v", i+1, err)
+		log.Printf("Waiting for Keycloak (attempt %d): %v", i, err)
 		time.Sleep(5 * time.Second)
 	}
-	if err != nil {
-		log.Fatalf("Failed to connect to Keycloak: %v", err)
-	}
 
-	// Build endpoint using public URL so browser redirects go to localhost
-	publicIssuer := fmt.Sprintf("%s/realms/%s", publicURL, realm)
-	endpoint := oauth2.Endpoint{
-		AuthURL:  publicIssuer + "/protocol/openid-connect/auth",
-		TokenURL: internalIssuer + "/protocol/openid-connect/token",
-	}
+	// Rewrite any public-facing URLs in the discovery doc to internal ones
+	// so server-side calls (JWKS fetch, token exchange) go via cluster DNS
+	jwksURI := strings.ReplaceAll(discovery.JWKSURI, publicURL, internalURL)
+	tokenURL := strings.ReplaceAll(discovery.TokenURL, publicURL, internalURL)
+
+	// Build verifier directly — skip oidc.NewProvider which enforces issuer match
+	keySet := oidc.NewRemoteKeySet(context.Background(), jwksURI)
+	verifier = oidc.NewVerifier(publicIssuer, keySet, &oidc.Config{
+		ClientID: clientID,
+	})
 
 	oauth2Config = oauth2.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		RedirectURL:  redirectURL,
-		Endpoint:     endpoint,
-		Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
+		Endpoint: oauth2.Endpoint{
+			// AuthURL is browser-facing → use public URL
+			AuthURL: publicIssuer + "/protocol/openid-connect/auth",
+			// TokenURL is server-side → use internal URL
+			TokenURL: tokenURL,
+		},
+		Scopes: []string{oidc.ScopeOpenID, "profile", "email"},
 	}
 
-	// SkipIssuerCheck because tokens will have the public issuer URL
-	// but we discovered via the internal URL
-	verifier = provider.Verifier(&oidc.Config{
-		ClientID:        clientID,
-		SkipIssuerCheck: true,
-	})
+	ready.Store(true)
+	log.Println("Keycloak connection established — auth service ready")
 }
 
 func generateState() string {
 	b := make([]byte, 16)
 	rand.Read(b)
 	return base64.URLEncoding.EncodeToString(b)
+}
+
+// /healthz — liveness: is the process alive? Always 200.
+func handleLiveness(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
+}
+
+// /readyz — readiness: is Keycloak connected? 503 until ready.
+func handleReadiness(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if !ready.Load() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "waiting for keycloak"})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func requireReady(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !ready.Load() {
+			http.Error(w, "Service initializing, please retry shortly", http.StatusServiceUnavailable)
+			return
+		}
+		next(w, r)
+	}
 }
 
 func handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -190,17 +238,15 @@ func handleValidate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-}
-
 func main() {
-	http.HandleFunc("/health", handleHealth)
-	http.HandleFunc("/login", handleLogin)
-	http.HandleFunc("/callback", handleCallback)
-	http.HandleFunc("/logout", handleLogout)
-	http.HandleFunc("/validate", handleValidate)
+	go initKeycloak()
+
+	http.HandleFunc("/healthz", handleLiveness)
+	http.HandleFunc("/readyz", handleReadiness)
+	http.HandleFunc("/login", requireReady(handleLogin))
+	http.HandleFunc("/callback", requireReady(handleCallback))
+	http.HandleFunc("/logout", requireReady(handleLogout))
+	http.HandleFunc("/validate", requireReady(handleValidate))
 
 	port := getEnv("PORT", "8080")
 	log.Printf("Auth service starting on port %s", port)

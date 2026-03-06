@@ -48,6 +48,17 @@ data:
       ]
     }
 ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: keycloak-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -91,19 +102,24 @@ spec:
         volumeMounts:
         - name: realm-config
           mountPath: /opt/keycloak/data/import
+        - name: keycloak-data
+          mountPath: /opt/keycloak/data/h2
         readinessProbe:
           httpGet:
             path: /realms/master
             port: 8080
           initialDelaySeconds: 30
           periodSeconds: 10
-          failureThreshold: 10
+          failureThreshold: 30
+          timeoutSeconds: 5
         livenessProbe:
           httpGet:
             path: /realms/master
             port: 8080
-          initialDelaySeconds: 60
-          periodSeconds: 15
+          initialDelaySeconds: 120
+          periodSeconds: 20
+          failureThreshold: 5
+          timeoutSeconds: 5
         resources:
           requests:
             memory: "512Mi"
@@ -115,6 +131,9 @@ spec:
       - name: realm-config
         configMap:
           name: keycloak-realm-config
+      - name: keycloak-data
+        persistentVolumeClaim:
+          claimName: keycloak-data
 ---
 apiVersion: v1
 kind: Service
